@@ -1,0 +1,25 @@
+﻿---
+BasedOnStyle: Google
+AccessModifierOffset: '-2'
+AlignAfterOpenBracket: Align
+AlignConsecutiveMacros: 'true'
+AlignConsecutiveAssignments: 'true'
+AlignConsecutiveDeclarations: 'true'
+AlignOperands: 'true'
+AlignTrailingComments: 'true'
+AllowShortFunctionsOnASingleLine: All
+AllowShortIfStatementsOnASingleLine: WithoutElse
+AllowShortLambdasOnASingleLine: All
+AllowShortLoopsOnASingleLine: 'true'
+IndentWidth: '4'
+SpaceAfterCStyleCast: 'true'
+SpaceBeforeInheritanceColon: 'true'
+SpaceBeforeRangeBasedForLoopColon: 'true'
+SpaceInEmptyParentheses: 'true'
+SpacesBeforeTrailingComments: '2'
+SpacesInCStyleCastParentheses: 'true'
+Standard: Auto
+TabWidth: '4'
+UseTab: Never
+
+...

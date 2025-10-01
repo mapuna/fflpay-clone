@@ -1,0 +1,28 @@
+# Build directories
+build/
+cmake-build-*/
+
+# Executables
+ffplay_clone
+*.exe
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# CMake files
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+
+# VCPKG installed packages (if included in the project)
+vcpkg_installed/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+.clangd
