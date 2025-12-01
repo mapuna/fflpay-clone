@@ -10,8 +10,10 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstring>
 #include <mutex>
+#include <queue>
 #include <string>
 #include <thread>
 
@@ -56,6 +58,109 @@ struct AdaptiveSettings {
     int     packet_size        = 188;
 };
 
+struct PacketQueue {
+    std::queue<AVPacket*>   packets;
+    std::mutex              mutex;
+    std::condition_variable cond_var;
+    int                     max_packets = 100;
+    int                     min_packets = 10;
+    bool                    finished    = false;
+    int64_t                 total_size  = 0;
+    int64_t                 max_size    = 15 * 1024 * 1024;  // 15 MB default
+
+    void push(AVPacket* pkt) {
+        std::lock_guard<std::mutex> lock(mutex);
+
+        if (packets.size( ) >= ( size_t ) max_packets ||
+            total_size >= max_size) {
+            spdlog::warn(
+                "Packet queue full (size={}, bytes={}), dropping oldest packet",
+                packets.size( ), total_size);
+            if (!packets.empty( )) {
+                AVPacket* old_pkt = packets.front( );
+                packets.pop( );
+                total_size -= old_pkt->size;
+                av_packet_free(&old_pkt);
+            }
+        }
+
+        AVPacket* new_pkt = av_packet_alloc( );
+        av_packet_ref(new_pkt, pkt);
+        packets.push(new_pkt);
+        total_size += pkt->size;
+        cond_var.notify_one( );
+    }
+
+    AVPacket* pop(int timeout_ms = 100) {
+        std::unique_lock<std::mutex> lock(mutex);
+
+        auto now      = std::chrono::steady_clock::now( );
+        auto deadline = now + std::chrono::milliseconds(timeout_ms);
+
+        while (packets.empty( ) && !finished) {
+            if (cond_var.wait_until(lock, deadline) ==
+                std::cv_status::timeout) {
+                return nullptr;
+            }
+        }
+
+        if (packets.empty( )) {
+            return nullptr;
+        }
+
+        AVPacket* pkt = packets.front( );
+        packets.pop( );
+        total_size -= pkt->size;
+        return pkt;
+    }
+
+    int size( ) {
+        std::lock_guard<std::mutex> lock(mutex);
+        return packets.size( );
+    }
+
+    void adapt_to_network(const NetworkMetrics& metrics) {
+        std::lock_guard<std::mutex> lock(mutex);
+
+        if (metrics.packet_loss_rate > 5.0 || metrics.jitter > 50.0) {
+            max_packets = 200;
+            max_size    = 30 * 1024 * 1024;  // 30 MB
+            min_packets = 50;
+        } else if (metrics.packet_loss_rate > 2.0 || metrics.jitter > 20.0) {
+            max_packets = 150;
+            max_size    = 20 * 1024 * 1024;  // 20 MB
+            min_packets = 30;
+        } else {
+            max_packets = 100;
+            max_size    = 15 * 1024 * 1024;  // 15 MB
+            min_packets = 10;
+        }
+
+        spdlog::debug(
+            "Packet queue adapted: max_packets={}, max_size={} MB, "
+            "min_packets={}",
+            max_packets, max_size / 1024 / 1024, min_packets);
+    }
+
+    void set_finished( ) {
+        std::lock_guard<std::mutex> lock(mutex);
+        finished = true;
+        cond_var.notify_all( );
+    }
+
+    void clear( ) {
+        std::lock_guard<std::mutex> lock(mutex);
+        while (!packets.empty( )) {
+            AVPacket* pkt = packets.front( );
+            packets.pop( );
+            av_packet_free(&pkt);
+        }
+        total_size = 0;
+    }
+
+    ~PacketQueue( ) { clear( ); }
+};
+
 NetworkMetrics g_network_metrics;
 
 int get_interface_mtu(const char* interface_name) {
@@ -78,7 +183,6 @@ int get_interface_mtu(const char* interface_name) {
 }
 
 int detect_path_mtu(const char* hostname, int port = 554) {
-    // Step 1: Get the outgoing interface for the destination
     struct addrinfo hints, *result;
     memset(&hints, 0, sizeof(hints));
     hints.ai_family   = AF_INET;
@@ -98,7 +202,6 @@ int detect_path_mtu(const char* hostname, int port = 554) {
         return 1500;
     }
 
-    // Connect to determine the route (doesn't actually send data for UDP)
     if (connect(sock, result->ai_addr, result->ai_addrlen) != 0) {
         close(sock);
         freeaddrinfo(result);
@@ -106,7 +209,6 @@ int detect_path_mtu(const char* hostname, int port = 554) {
         return 1500;
     }
 
-    // Get the local address used for this connection
     struct sockaddr_in local_addr;
     socklen_t          addr_len = sizeof(local_addr);
     if (getsockname(sock, ( struct sockaddr* ) &local_addr, &addr_len) != 0) {
@@ -118,7 +220,6 @@ int detect_path_mtu(const char* hostname, int port = 554) {
     close(sock);
     freeaddrinfo(result);
 
-    // Step 2: Find the interface with this local address
     struct ifaddrs *ifaddr, *ifa;
     if (getifaddrs(&ifaddr) == -1) {
         spdlog::warn("MTU detection: Cannot get interface addresses");
@@ -142,7 +243,6 @@ int detect_path_mtu(const char* hostname, int port = 554) {
 
     freeifaddrs(ifaddr);
 
-    // Step 3: Get MTU of the interface
     if (strlen(interface_name) > 0) {
         int iface_mtu = get_interface_mtu(interface_name);
         if (iface_mtu > 0) {
@@ -161,7 +261,6 @@ int detect_path_mtu(const char* hostname, int port = 554) {
             "default MTU");
     }
 
-    // Step 4: Try to get Path MTU from kernel (Linux specific)
     sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (sock >= 0) {
         memset(&hints, 0, sizeof(hints));
@@ -173,12 +272,10 @@ int detect_path_mtu(const char* hostname, int port = 554) {
                 int       pmtu   = 0;
                 socklen_t optlen = sizeof(pmtu);
 
-                // Enable path MTU discovery
                 int val = IP_PMTUDISC_DO;
                 setsockopt(sock, IPPROTO_IP, IP_MTU_DISCOVER, &val,
                            sizeof(val));
 
-                // Try to get the actual path MTU
                 if (getsockopt(sock, IPPROTO_IP, IP_MTU, &pmtu, &optlen) == 0 &&
                     pmtu > 0) {
                     mtu = pmtu;
@@ -205,7 +302,6 @@ void update_network_metrics(AVFormatContext* format_context, AVPacket* packet) {
 
     int64_t current_time = get_current_time_microseconds( );
 
-    // Track actual bytes received from packets
     if (packet && packet->size > 0) {
         g_network_metrics.bytes_received += packet->size;
 
@@ -217,7 +313,6 @@ void update_network_metrics(AVFormatContext* format_context, AVPacket* packet) {
          */
     }
 
-    // Calculate network bandwidth every second
     if (g_network_metrics.last_bandwidth_check == 0) {
         g_network_metrics.last_bandwidth_check = current_time;
         g_network_metrics.bytes_last_second = g_network_metrics.bytes_received;
@@ -240,7 +335,6 @@ void update_network_metrics(AVFormatContext* format_context, AVPacket* packet) {
         g_network_metrics.bytes_last_second = g_network_metrics.bytes_received;
     }
 
-    // Inter-packet timing for jitter calculation
     if (g_network_metrics.last_packet_time > 0) {
         double time_diff_ms =
             (current_time - g_network_metrics.last_packet_time) / 1000.0;
@@ -273,7 +367,6 @@ void update_network_metrics(AVFormatContext* format_context, AVPacket* packet) {
     /* Packet loss detection */
     g_network_metrics.total_packets += 1;
 
-    // Method 1: check for timing gaps (network stalls/retransmissions)
     if (g_network_metrics.total_packets > 100 && previous_packet_time > 0) {
         static double expected_interval = 0;
         double        current_interval =
@@ -285,8 +378,6 @@ void update_network_metrics(AVFormatContext* format_context, AVPacket* packet) {
             expected_interval =
                 0.95 * expected_interval + 0.05 * current_interval;
 
-            // Detect significant gaps (> 5x expected) as potential
-            // loss/retransmit
             if (current_interval > expected_interval * 5 &&
                 expected_interval > 1.0) {
                 g_network_metrics.lost_packets++;
@@ -297,10 +388,8 @@ void update_network_metrics(AVFormatContext* format_context, AVPacket* packet) {
         }
     }
 
-    // Method 2: FFmpeg's internal statistics if available
     if (format_context && format_context->pb) {
         AVIOContext* io = format_context->pb;
-        // Check for errors or interruptions in the IO context
         if (io->error != 0) {
             static int last_error_count = 0;
             if (io->error != last_error_count) {
@@ -310,7 +399,6 @@ void update_network_metrics(AVFormatContext* format_context, AVPacket* packet) {
         }
     }
 
-    // Packet loss rate
     if (g_network_metrics.total_packets > 0) {
         g_network_metrics.packet_loss_rate =
             ( double ) g_network_metrics.lost_packets /
@@ -324,8 +412,6 @@ AdaptiveSettings adapt_settings_based_on_network( ) {
     AdaptiveSettings settings;
 
     if (g_network_metrics.bandwidth > 0.1) {
-        // Calculate buffer based on measured bandwidth
-        // Formula: buffer to hold ~2 seconds of data, increased by packet loss
         double buffer_seconds =
             2.0 + (g_network_metrics.packet_loss_rate / 10.0);
         int64_t calculated_buffer =
@@ -335,7 +421,6 @@ AdaptiveSettings adapt_settings_based_on_network( ) {
             ( int64_t ) (512 * 1024),
             std::min(calculated_buffer, ( int64_t ) (8 * 1024 * 1024)));
     } else {
-        // No bandwidth measured yet, use moderate default
         settings.buffer_size = 2 * 1024 * 1024;
     }
 
@@ -369,6 +454,80 @@ AdaptiveSettings adapt_settings_based_on_network( ) {
     return settings;
 }
 
+bool apply_settings_at_runtime(AVFormatContext*        format_context,
+                               const AdaptiveSettings& settings) {
+    if (!format_context || !format_context->pb) {
+        return false;
+    }
+
+    bool changes_made = false;
+    int  opt_ret;
+
+    char timeout_str[32];
+    snprintf(timeout_str, sizeof(timeout_str), "%lld",
+             ( long long ) settings.timeout);
+
+    opt_ret = av_opt_set(format_context->priv_data, "timeout", timeout_str,
+                         AV_OPT_SEARCH_CHILDREN);
+    if (opt_ret >= 0) {
+        spdlog::info("Runtime: Updated timeout to {:.2f}s",
+                     settings.timeout / 1000000.0);
+        changes_made = true;
+    }
+
+    char buffer_size_str[32];
+    snprintf(buffer_size_str, sizeof(buffer_size_str), "%d",
+             settings.buffer_size);
+
+    opt_ret = av_opt_set(format_context->priv_data, "buffer_size",
+                         buffer_size_str, AV_OPT_SEARCH_CHILDREN);
+    if (opt_ret >= 0) {
+        spdlog::info("Runtime: Updated buffer_size to {} bytes via av_opt_set",
+                     settings.buffer_size);
+        changes_made = true;
+    }
+
+    char reorder_str[32];
+    snprintf(reorder_str, sizeof(reorder_str), "%d",
+             settings.reorder_queue_size);
+
+    opt_ret = av_opt_set(format_context->priv_data, "reorder_queue_size",
+                         reorder_str, AV_OPT_SEARCH_CHILDREN);
+    if (opt_ret >= 0) {
+        spdlog::info("Runtime: Updated reorder_queue_size to {}",
+                     settings.reorder_queue_size);
+        changes_made = true;
+    }
+
+    return changes_made;
+}
+
+bool pause_resume_stream(AVFormatContext* format_context, bool pause) {
+    if (!format_context) {
+        return false;
+    }
+
+    int ret;
+    if (pause) {
+        ret = av_read_pause(format_context);
+        if (ret >= 0) {
+            spdlog::info("Runtime: Paused RTSP stream for flow control");
+            return true;
+        } else {
+            spdlog::warn("Runtime: Failed to pause stream (ret={})", ret);
+        }
+    } else {
+        ret = av_read_play(format_context);
+        if (ret >= 0) {
+            spdlog::info("Runtime: Resumed RTSP stream");
+            return true;
+        } else {
+            spdlog::warn("Runtime: Failed to resume stream (ret={})", ret);
+        }
+    }
+    return false;
+}
+
 std::atomic<bool> g_should_stop_monitoring(false);
 
 void network_monitor_thread( ) {
@@ -386,6 +545,99 @@ void network_monitor_thread( ) {
                 g_network_metrics.mtu_size);
         }
     }
+}
+
+void packet_reader_thread(AVFormatContext* format_context, PacketQueue* queue,
+                          std::atomic<bool>* should_stop) {
+    AVPacket packet;
+    int      packets_read           = 0;
+    int64_t  last_adaptation_time   = get_current_time_microseconds( );
+    int64_t  last_flow_control_time = get_current_time_microseconds( );
+    bool     stream_paused          = false;
+
+    spdlog::info("Packet reader thread started");
+
+    while (!(*should_stop)) {
+        int ret = av_read_frame(format_context, &packet);
+
+        if (ret < 0) {
+            if (ret == AVERROR_EOF) {
+                spdlog::info("End of stream reached");
+            } else {
+                char errbuf[1024];
+                av_strerror(ret, errbuf, sizeof(errbuf));
+                spdlog::warn("Error reading frame: {}", errbuf);
+            }
+            break;
+        }
+
+        update_network_metrics(format_context, &packet);
+
+        queue->push(&packet);
+        av_packet_unref(&packet);
+
+        packets_read++;
+
+        if (packets_read % 100 == 0) {
+            AdaptiveSettings new_settings = adapt_settings_based_on_network( );
+
+            apply_settings_at_runtime(format_context, new_settings);
+
+            queue->adapt_to_network(g_network_metrics);
+
+            last_adaptation_time = get_current_time_microseconds( );
+        }
+
+        int queue_size = queue->size( );
+        int queue_min  = queue->min_packets;
+        int queue_max  = queue->max_packets;
+
+        {
+            std::lock_guard<std::mutex> lock(g_network_metrics.metrics_mutex);
+
+            if (queue_size > queue_max * 0.8) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            }
+
+            int64_t current_time = get_current_time_microseconds( );
+            if (g_network_metrics.packet_loss_rate > 15.0 &&
+                current_time - last_flow_control_time >
+                    5000000) {  // Every 5 seconds
+
+                if (!stream_paused) {
+                    spdlog::warn(
+                        "High packet loss ({:.2f}%), pausing stream briefly",
+                        g_network_metrics.packet_loss_rate);
+                    if (pause_resume_stream(format_context, true)) {
+                        stream_paused = true;
+                        std::this_thread::sleep_for(
+                            std::chrono::milliseconds(500));
+                    }
+                }
+                last_flow_control_time = current_time;
+            } else if (stream_paused &&
+                       g_network_metrics.packet_loss_rate < 5.0) {
+                spdlog::info("Network recovered, resuming stream");
+                pause_resume_stream(format_context, false);
+                stream_paused          = false;
+                last_flow_control_time = current_time;
+            }
+
+            if (g_network_metrics.jitter > 50.0) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            } else if (g_network_metrics.jitter > 20.0) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+        }
+    }
+
+    if (stream_paused) {
+        pause_resume_stream(format_context, false);
+    }
+
+    queue->set_finished( );
+    spdlog::info("Packet reader thread finished. Read {} packets",
+                 packets_read);
 }
 
 int main(int argc, char* argv[]) {
@@ -422,14 +674,12 @@ int main(int argc, char* argv[]) {
 
     spdlog::info("Attempting to connect to RTSP stream: {}", rtsp_url);
 
-    // Extract hostname from RTSP URL for MTU detection
     std::string url_str(rtsp_url);
     std::string hostname;
     size_t      proto_end = url_str.find("://");
     if (proto_end != std::string::npos) {
         size_t host_start = proto_end + 3;
-        // Skip credentials if present
-        size_t at_pos = url_str.find('@', host_start);
+        size_t at_pos     = url_str.find('@', host_start);
         if (at_pos != std::string::npos) {
             host_start = at_pos + 1;
         }
@@ -453,8 +703,6 @@ int main(int argc, char* argv[]) {
         return -1;
     }
 
-    // Network metrics will be calculated from actual traffic
-    // Initialize to zero - will be populated as packets arrive
     g_network_metrics.packet_loss_rate = 0.0;
     g_network_metrics.average_latency  = 0.0;
     g_network_metrics.bandwidth        = 0.0;
@@ -467,7 +715,6 @@ int main(int argc, char* argv[]) {
 
     AdaptiveSettings settings = adapt_settings_based_on_network( );
 
-    // First attempt with current adaptive settings
     av_dict_set(&options, "rtsp_transport", settings.prefer_tcp ? "tcp" : "udp",
                 0);
     av_dict_set_int(&options, "buffer_size", settings.buffer_size, 0);
@@ -617,7 +864,6 @@ int main(int argc, char* argv[]) {
         return -1;
     }
 
-    // Create SDL renderer
     SDL_Renderer* renderer =
         SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
     if (!renderer) {
@@ -631,7 +877,6 @@ int main(int argc, char* argv[]) {
         return -1;
     }
 
-    // Create SDL texture
     SDL_Texture* texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_YV12,
                                              SDL_TEXTUREACCESS_STREAMING,
                                              codecpar->width, codecpar->height);
@@ -651,15 +896,22 @@ int main(int argc, char* argv[]) {
     spdlog::info("Created SDL window {}x{} for video playback", codecpar->width,
                  codecpar->height);
 
-    AVPacket packet;
-    AVFrame* frame        = av_frame_alloc( );
-    int      packets_read = 0;
-    bool     quit         = false;
+    PacketQueue       packet_queue;
+    std::atomic<bool> should_stop_reader(false);
+
+    spdlog::info("Starting packet reader thread with adaptive flow control...");
+    std::thread reader_thread(packet_reader_thread, format_context,
+                              &packet_queue, &should_stop_reader);
+
+    AVFrame* frame             = av_frame_alloc( );
+    int      packets_processed = 0;
+    int      frames_displayed  = 0;
+    bool     quit              = false;
+    int64_t  last_stats_time   = get_current_time_microseconds( );
 
     spdlog::info("Starting video playback with adaptive settings...");
 
-    while (!quit && av_read_frame(format_context, &packet) >= 0) {
-        // Handle SDL events
+    while (!quit) {
         SDL_Event event;
         while (SDL_PollEvent(&event)) {
             if (event.type == SDL_QUIT) {
@@ -668,15 +920,25 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        update_network_metrics(format_context, &packet);
+        if (quit) break;
 
-        if (packet.stream_index == video_stream_index) {
-            // Send packet to decoder
-            ret = avcodec_send_packet(codec_context, &packet);
+        AVPacket* packet = packet_queue.pop(100);
+
+        if (!packet) {
+            if (packet_queue.finished) {
+                spdlog::info("Queue finished, ending playback");
+                break;
+            }
+            continue;
+        }
+
+        packets_processed++;
+
+        if (packet->stream_index == video_stream_index) {
+            ret = avcodec_send_packet(codec_context, packet);
             if (ret < 0) {
                 spdlog::warn("Error sending packet to decoder");
             } else {
-                // Receive decoded frame
                 while (ret >= 0) {
                     ret = avcodec_receive_frame(codec_context, frame);
                     if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
@@ -686,38 +948,49 @@ int main(int argc, char* argv[]) {
                         break;
                     }
 
-                    // Update texture with decoded frame
                     SDL_UpdateYUVTexture(texture, NULL, frame->data[0],
                                          frame->linesize[0], frame->data[1],
                                          frame->linesize[1], frame->data[2],
                                          frame->linesize[2]);
 
-                    // Render frame
                     SDL_RenderClear(renderer);
                     SDL_RenderCopy(renderer, texture, NULL, NULL);
                     SDL_RenderPresent(renderer);
+
+                    frames_displayed++;
                 }
             }
         }
 
-        if (++packets_read % 100 == 0) {
-            settings = adapt_settings_based_on_network( );
-            spdlog::debug("Re-adjusted settings after {} packets",
-                          packets_read);
-        }
+        av_packet_free(&packet);
 
-        av_packet_unref(&packet);
+        int64_t current_time = get_current_time_microseconds( );
+        if (current_time - last_stats_time > 5000000) {  // Every 5 seconds
+            int queue_size = packet_queue.size( );
+            spdlog::info(
+                "Playback stats: queue_size={}, packets_processed={}, "
+                "frames_displayed={}, fps={:.1f}",
+                queue_size, packets_processed, frames_displayed,
+                frames_displayed / 5.0);
+            frames_displayed = 0;
+            last_stats_time  = current_time;
+        }
     }
 
-    spdlog::info("Video playback ended. Processed {} packets", packets_read);
+    spdlog::info("Video playback ended. Stopping reader thread...");
+    should_stop_reader = true;
+
+    if (reader_thread.joinable( )) {
+        reader_thread.join( );
+    }
+
+    spdlog::info("Processed {} packets total", packets_processed);
 
     av_frame_free(&frame);
     SDL_DestroyTexture(texture);
     SDL_DestroyRenderer(renderer);
     SDL_DestroyWindow(window);
     avcodec_free_context(&codec_context);
-
-    spdlog::info("Finished reading {} packets", packets_read);
 
     avformat_close_input(&format_context);
 
